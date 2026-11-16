@@ -263,6 +263,7 @@ def _print_static_usage() -> None:
     print("  cleanup                                                Remove stale instances")
     print("  save <instance>... | --all [--stop] [--as NAME]        Snapshot sessions (profile, tabs, cookies)")
     print("  restore [<name[@stamp]>...] [--all] [--any-port]       Bring saved sessions back")
+    print("  restore <name[@stamp]> --as NEW                        Bring one back under a new name")
     print("  snapshots [list|show|rm|export-key|import-key]         Manage saved snapshots")
     print("  guide [--path]                                         Print this tool's agent guide")
     print("  completions <zsh|instances|methods|events> [<instance>]  Shell completion and its data")
@@ -275,9 +276,9 @@ def _print_static_usage() -> None:
     print("                         attach, help and one-shots require it to match exactly one")
     print()
     print("Target selectors (TARGET -- pick one; usable on attach, stop and one-shots):")
-    print("  --target SPEC          Tab index if SPEC is fewer than 8 digits, else a target-id prefix")
+    print("  --target SPEC          Tab number if SPEC is fewer than 8 digits, else a target-id prefix")
     print("  --target-id ID         Always a target-id prefix (the `id` or `full_id` from status)")
-    print("  --target-index N       Always the 1-based index from status")
+    print("  --target-index N       Always a tab number: the Nth tab on screen, as status numbers it")
     print("  --url SUBSTRING        The tab whose URL contains SUBSTRING")
     print()
     print("CDP one-shot commands:")
@@ -366,7 +367,7 @@ def _run_status(args: list[str]) -> None:
     instance_name = args[0] if args else None
 
     try:
-        statuses = get_instance_status(instance_name=instance_name)
+        statuses = get_instance_status(instance_name=instance_name, order_tabs=True)
     except InstanceNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -519,7 +520,7 @@ def _run_stop(args: list[str], target_spec: str | None, target_by: str | None) -
     # If a target specifier was provided, resolve it to a target ID
     resolved_target_id = None
     if target_spec is not None:
-        from .attach import resolve_target
+        from .attach import resolve_page_target
         from .cdp_client import CDPClient, get_ws_url
         from .registry import lookup
 
@@ -529,28 +530,14 @@ def _run_stop(args: list[str], target_spec: str | None, target_by: str | None) -
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
 
-        async def _get_targets():
+        async def _resolve():
             browser_ws = get_ws_url(port=info.port, target_type="browser")
             async with CDPClient(ws_url=browser_ws) as cdp:
-                result = await cdp.send(method="Target.getTargets")
-                return sorted(
-                    (t for t in result.get("targetInfos", []) if t.get("type") == "page"),
-                    key=lambda t: t.get("targetId", ""),
-                )
+                return await resolve_page_target(cdp, target_spec, target_by)
 
         import asyncio
         try:
-            page_targets = asyncio.run(_get_targets())
-        except (ConnectionError, RuntimeError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        try:
-            resolved_target_id = resolve_target(
-                page_targets=page_targets,
-                target_spec=target_spec,
-                target_by=target_by,
-            )
+            resolved_target_id = asyncio.run(_resolve())
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
@@ -744,6 +731,7 @@ def _run_restore(args: list[str]) -> None:
     restore_all = here = any_port = replace_profile = start_display = False
     reattach = True
     desktop_mode = None
+    new_name = None
     refs = []
     i = 0
     while i < len(args):
@@ -763,12 +751,22 @@ def _run_restore(args: list[str]) -> None:
         elif arg == "--desktop" and i + 1 < len(args) and args[i + 1] in ("saved", "terminal"):
             desktop_mode = args[i + 1]
             i += 1
+        elif arg == "--as":
+            if i + 1 >= len(args) or args[i + 1].startswith("-") or not args[i + 1].strip():
+                print("Error: --as needs the name to restore the session under", file=sys.stderr)
+                sys.exit(1)
+            new_name = args[i + 1]
+            i += 1
         elif arg.startswith("-"):
             print(f"Error: unknown restore option: {arg}", file=sys.stderr)
             sys.exit(1)
         else:
             refs.append(arg)
         i += 1
+
+    if new_name and (restore_all or not refs):
+        print("Error: --as renames a single session; name the snapshot to restore", file=sys.stderr)
+        sys.exit(1)
 
     cwd = os.getcwd()
     try:
@@ -796,6 +794,10 @@ def _run_restore(args: list[str]) -> None:
             desktop_mode = desktop_mode or "terminal"
         if here:
             versions = [v for v in versions if v.info.get("origin_dir") == cwd]
+        if new_name and len(versions) > 1:
+            print(f"Error: --as renames a single session, but {len(versions)} snapshots matched: "
+                  f"{', '.join(v.ref for v in versions)}", file=sys.stderr)
+            sys.exit(1)
     except SnapshotError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -816,6 +818,7 @@ def _run_restore(args: list[str]) -> None:
             report = restore_version(
                 version, any_port=any_port, desktop_mode=desktop_mode, reattach=reattach,
                 replace_profile=replace_profile, start_display=start_display,
+                instance_name=new_name,
             )
         except (SnapshotError, SnapshotKeyError, RuntimeError, TimeoutError, ConnectionError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -1044,23 +1047,13 @@ async def _run_cdp_one_shot(
     try:
         async with CDPClient(ws_url=browser_ws_url) as cdp:
             # Resolve target
-            targets_result = await cdp.send(method="Target.getTargets")
-            page_targets = sorted(
-                (t for t in targets_result.get("targetInfos", [])
-                 if t.get("type") == "page"),
-                key=lambda t: t.get("targetId", ""),
-            )
-
-            if not page_targets:
+            from .attach import resolve_page_target
+            from .errors import NoPageError
+            try:
+                target_id = await resolve_page_target(cdp, target_spec, target_by)
+            except NoPageError:
                 print("Error: no page targets in browser", file=sys.stderr)
                 sys.exit(1)
-
-            from .attach import resolve_target
-            target_id = resolve_target(
-                page_targets=page_targets,
-                target_spec=target_spec,
-                target_by=target_by,
-            )
 
             # Create isolated session
             session_result = await cdp.send(

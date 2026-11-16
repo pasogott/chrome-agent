@@ -398,6 +398,7 @@ def _strip_marker(title: str, name: str) -> str:
 async def _capture_live(port: int, name: str) -> dict:
     """Windows, tabs (in window order, with the active one marked) and cookies."""
     from .cdp_client import CDPClient, get_ws_url
+    from .taborder import sort_key, tab_positions
 
     async with CDPClient(ws_url=get_ws_url(port=port, target_type="browser")) as cdp:
         targets = (await cdp.send(method="Target.getTargets")).get("targetInfos", [])
@@ -430,9 +431,17 @@ async def _capture_live(port: int, name: str) -> dict:
                 "active": active,
             })
         cookies = (await cdp.send(method="Storage.getCookies")).get("cookies", [])
+        # CDP lists pages in no particular order; restore reopens tabs in the
+        # order saved here, so put each window's tabs in their on-screen order.
+        positions = await tab_positions(cdp)
+        for window in windows.values():
+            window["tabs"].sort(key=lambda tab: sort_key(positions, tab["targetId"]))
 
     ordered = [windows[k] for k in sorted(windows)]
-    return {"windows": ordered, "cookies": [_cookie_param(c) for c in cookies]}
+    return {
+        "windows": ordered, "cookies": [_cookie_param(c) for c in cookies],
+        "tab_order": bool(positions),
+    }
 
 
 async def _is_visible(cdp, target_id: str) -> bool:
@@ -506,7 +515,7 @@ def _is_attach_argv(argv: list[str]) -> int | None:
     return None
 
 
-def _capture_subscriptions(name: str, windows: list[dict]) -> list[dict]:
+def _capture_subscriptions(name: str, windows: list[dict], tab_order: bool = False) -> list[dict]:
     """Every `chrome-agent attach` process observing this instance.
 
     Each is recorded with its events, its tab (as a position in the saved tab
@@ -517,7 +526,10 @@ def _capture_subscriptions(name: str, windows: list[dict]) -> list[dict]:
     from .registry import is_pattern
 
     tabs = [tab for window in windows for tab in window["tabs"]]
-    by_sorted_id = sorted(tabs, key=lambda t: t["targetId"])
+    # How --target-index numbers tabs (taborder.numbered_pages): on-screen
+    # order when it was readable -- the order ``tabs`` is already in -- and
+    # by target id otherwise.
+    by_number = tabs if tab_order else sorted(tabs, key=lambda t: t["targetId"])
     found, seen_wrappers = [], set()
     me = os.getpid()
     for entry in os.listdir("/proc"):
@@ -539,8 +551,8 @@ def _capture_subscriptions(name: str, windows: list[dict]) -> list[dict]:
                 flag, spec = arg, attach_argv[j + 1]
         if flag in ("--target-index",) or (flag == "--target" and spec.isdigit() and len(spec) < 8):
             k = int(spec) - 1
-            if 0 <= k < len(by_sorted_id):
-                tab_position = tabs.index(by_sorted_id[k])
+            if 0 <= k < len(by_number):
+                tab_position = tabs.index(by_number[k])
         elif flag in ("--target-id", "--target"):
             hits = [t for t in tabs if t["targetId"].upper().startswith(spec.upper())]
             if len(hits) == 1:
@@ -791,7 +803,7 @@ def save_instance(
     live = asyncio.run(_capture_live(plan.port, plan.name))
     on_virtual = "virtual_display" in plan.launch
     desktop_map = {} if on_virtual else _capture_desktops(plan.pid, live["windows"])
-    subscriptions = _capture_subscriptions(plan.name, live["windows"])
+    subscriptions = _capture_subscriptions(plan.name, live["windows"], live["tab_order"])
     for window in live["windows"]:
         window.pop("_title", None)
     primary = desktop_map.get(str(live["windows"][0]["windowId"])) if live["windows"] else None
@@ -918,6 +930,24 @@ def _rewrite_target(argv: list[str], flag: str, spec: str, new_id: str) -> list[
             out.append(argv[i])
             i += 1
     return out
+
+
+def _rename_subscription(sub: dict, old: str, new: str) -> dict:
+    """An observer record re-addressed from instance ``old`` to ``new``.
+
+    The attach command names its instance right after ``attach``; a shell
+    loop that re-attaches names it inside its script, as a whole word. An
+    observer addressed by a glob is left as it was.
+    """
+    argv = list(sub["argv"])
+    if len(argv) > 1 and argv[1] == old:
+        argv[1] = new
+    sub = {**sub, "argv": argv}
+    wrapper = sub.get("wrapper")
+    if wrapper is not None:
+        word = re.compile(rf"(?<![\w.-]){re.escape(old)}(?![\w.-])")
+        sub["wrapper"] = {**wrapper, "argv": [word.sub(new, part) for part in wrapper["argv"]]}
+    return sub
 
 
 def _restore_subscriptions(
@@ -1092,12 +1122,15 @@ async def _restore_tabs(
 
 def check_restorable(
     version: Version, state: dict, any_port: bool, replace_profile: bool = False,
-    start_display: bool = False,
+    start_display: bool = False, instance_name: str | None = None,
 ) -> str | None:
-    """Why this version cannot be restored right now, or None."""
+    """Why this version cannot be restored right now, or None.
+
+    ``instance_name`` is the name it will run under, when not the saved one.
+    """
     from .registry import InstanceNotFoundError, _port_is_listening, lookup
 
-    instance = state["instance"]
+    instance = instance_name or state["instance"]
     try:
         if lookup(instance_name=instance).alive:
             return f"{instance} is already running (stop it first, or it was already restored)"
@@ -1131,15 +1164,21 @@ def restore_version(
     reattach: bool = True,
     replace_profile: bool = False,
     start_display: bool = False,
+    instance_name: str | None = None,
     key: bytes | None = None,
 ) -> dict:
-    """Bring a saved version back as a running instance. Returns a report."""
+    """Bring a saved version back as a running instance. Returns a report.
+
+    ``instance_name`` restores it under a new name (``restore --as``); the
+    snapshot itself is unchanged, and the next save files it under the new name.
+    """
     from .launcher import _SESSION_ROOT, launch_browser
     from .registry import _port_is_listening
 
     key = key or get_key(create=False)
     state = read_state(version, key)
-    problem = check_restorable(version, state, any_port, replace_profile, start_display)
+    name = instance_name or state["instance"]
+    problem = check_restorable(version, state, any_port, replace_profile, start_display, name)
     if problem:
         raise SnapshotError(f"cannot restore {version.ref}: {problem}")
 
@@ -1212,7 +1251,7 @@ def restore_version(
         extra_args=extra_args,
         window_border=launch.get("window_border", True),
         profile_dir=None if override else profile_dir,
-        instance_name=state["instance"],
+        instance_name=name,
         desktop=target_desktop,
         env_overrides=launch.get("env") or None,
     ))
@@ -1239,7 +1278,10 @@ def restore_version(
                 offset = 0 if saved is None or primary_desktop is None else saved - primary_desktop
                 desktops.move_window(p["x_window"], base + offset)
 
-    subscriptions = _restore_subscriptions(state.get("subscriptions", []), id_map, reattach)
+    subscriptions = state.get("subscriptions", [])
+    if name != state["instance"]:
+        subscriptions = [_rename_subscription(sub, state["instance"], name) for sub in subscriptions]
+    subscriptions = _restore_subscriptions(subscriptions, id_map, reattach)
 
     return {
         "snapshot": version.ref,

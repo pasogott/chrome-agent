@@ -12,35 +12,35 @@ Multiple agents and humans can share the same browser simultaneously, each with 
 <h3 align="center">Used by engineers at</h3>
 
 <p align="center">
-  <img src="docs/logos/microsoft.svg" alt="Microsoft" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/microsoft.svg" alt="Microsoft" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/johns-hopkins-university.svg" alt="Johns Hopkins University" height="30">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/johns-hopkins-university.svg" alt="Johns Hopkins University" height="30">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/bosch.svg" alt="Bosch" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/bosch.svg" alt="Bosch" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/texas-instruments.svg" alt="Texas Instruments" height="30">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/texas-instruments.svg" alt="Texas Instruments" height="30">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/deutsche-telekom.svg" alt="Deutsche Telekom" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/deutsche-telekom.svg" alt="Deutsche Telekom" height="28">
   <br><br>
-  <img src="docs/logos/texas-am-university.svg" alt="Texas A&amp;M University" height="30">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/texas-am-university.svg" alt="Texas A&amp;M University" height="30">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/red-hat.svg" alt="Red Hat" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/red-hat.svg" alt="Red Hat" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/sysco.svg" alt="Sysco" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/sysco.svg" alt="Sysco" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/databricks.svg" alt="Databricks" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/databricks.svg" alt="Databricks" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/grainger.svg" alt="Grainger" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/grainger.svg" alt="Grainger" height="28">
   <br><br>
-  <img src="docs/logos/posthog.svg" alt="PostHog" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/posthog.svg" alt="PostHog" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/nextiva.svg" alt="Nextiva" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/nextiva.svg" alt="Nextiva" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/jusbrasil.svg" alt="Jusbrasil" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/jusbrasil.svg" alt="Jusbrasil" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/parcellab.svg" alt="parcelLab" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/parcellab.svg" alt="parcelLab" height="28">
   &nbsp;&nbsp;&nbsp;
-  <img src="docs/logos/zuru-tech.svg" alt="ZURU Tech" height="28">
+  <img src="https://raw.githubusercontent.com/captivus/chrome-agent/main/docs/logos/zuru-tech.svg" alt="ZURU Tech" height="28">
 </p>
 
 ## Why this exists
@@ -233,6 +233,7 @@ chrome-agent help [<instance|glob>] [Domain | Domain.method]
 chrome-agent cleanup
 chrome-agent save <instance|glob>... | --all [--stop] [--as NAME] [--overwrite | --keep-both]
 chrome-agent restore [<name[@stamp]>...] | --all [--here] [--any-port] [--desktop saved|terminal] [--no-reattach] [--replace-profile] [--start-display]
+chrome-agent restore <name[@stamp]> --as NEW-NAME [...]
 chrome-agent snapshots [list [<glob>] | show <name[@stamp]> | rm <ref>... [--older-than AGE] [--yes] | export-key | import-key [--replace]]
 chrome-agent completions <zsh | instances | snapshots | methods | events> [<instance>]
 chrome-agent --version
@@ -241,13 +242,13 @@ chrome-agent --version
 | Command | Description |
 |---------|-------------|
 | `launch` | Find Chrome, launch with CDP enabled. Auto-allocates a port and names the instance from the current directory. |
-| `status` | List running instances with their page targets (IDs, URLs, titles). Accepts a glob to list a matching subset. A browser you cannot see is tagged in the header -- `[Xvfb :95]` for one on a virtual X display (Xvfb, Xvnc, Xephyr), `[headless]` for one with no window -- and the JSON form carries a `display` field for every live instance (`{"kind": "desktop" \| "virtual" \| "headless", ...}`). |
-| `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab index, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. |
-| `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Accepts a glob, stopping every matching instance. Use `--target` or `--url` to close a single tab without affecting the browser; because this closes a tab, prefer the explicit `--target-id` / `--target-index`. |
+| `status` | List running instances with their page targets (IDs, URLs, titles), in the order the tabs sit on screen, window by window, numbered `[1]`, `[2]`, ... left to right -- the numbers `--target N` and `--target-index N` select. If the order cannot be read, `status` says so and numbers tabs by target id instead. Accepts a glob to list a matching subset. A browser you cannot see is tagged in the header -- `[Xvfb :95]` for one on a virtual X display (Xvfb, Xvnc, Xephyr), `[headless]` for one with no window -- and the JSON form carries a `display` field for every live instance (`{"kind": "desktop" \| "virtual" \| "headless", ...}`). |
+| `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab number, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. Tab `N` is the Nth tab on screen, as `status` numbers them. |
+| `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Accepts a glob, stopping every matching instance. Use `--target` or `--url` to close a single tab without affecting the browser; because this closes a tab, prefer `--target-id`: an id never changes, while a tab's number shifts whenever tabs are opened, closed or dragged. |
 | `help` | Query the browser's protocol schema. Lists domains, commands, events, parameters. |
 | `cleanup` | Remove stale instances (dead browsers) and their session directories. |
 | `save` | Snapshot running instances -- profile, tabs, cookies, launch flags, desktop, observers -- so they can be restored later. See [Saving and Restoring Sessions](#saving-and-restoring-sessions). |
-| `restore` | Bring snapshots back as running instances under their original names and ports. |
+| `restore` | Bring snapshots back as running instances under their original names and ports (or one under a new name, with `--as`). |
 | `snapshots` | List, inspect (`show`) and delete (`rm`) saved snapshots; back up the encryption key. |
 | `completions` | `zsh` prints a shell completion; `instances`, `methods` and `events` print `name:description` lines for the registered instances and for the running browser's CDP protocol (what the completion reads as you type). |
 | `--version` | Print the installed chrome-agent version (`-V` alias) and exit. |
@@ -270,6 +271,7 @@ A snapshot holds everything needed to bring an instance back as it was:
 - **The profile** -- cookies, localStorage, IndexedDB, saved logins -- minus caches and components Chrome re-downloads on its own (a real profile is typically 5-20 MB saved).
 - **Every cookie the browser holds in memory**, including session cookies that are never written to disk; they are set again on restore before any tab loads.
 - **Windows and tabs**, with each window's size, position and active tab.
+- **Tab order**, window by window, as the tabs sit on screen. CDP has no command for tab order (`Target.getTargets` lists pages in an order of its own), so `save`, `status` and selecting a tab by number load a tiny bundled extension over CDP for a moment (about a tenth of a second), read the order from Chrome's extension API, and uninstall it; an extension loaded this way does not survive a restart, so it never ends up in a saved profile. Where Chrome refuses (extensions disabled by policy or flag), tabs fall back to target-id order -- for numbering too, so `status` and `--target N` still agree.
 - **Name, port and working directory**, so an agent or script that addresses `mysite-01` (or its port) carries on unchanged. A fresh `launch` avoids the ports the last `save --all` will restore onto.
 - **Launch settings** -- headless, extra Chrome flags, fingerprint flags and TZ, window border, and a custom `--user-data-dir` if one was given.
 - **The virtual desktop** of each window (Linux/X11), or -- for a browser kept off-screen on a virtual X display (Xvfb, Xvnc, Xephyr) -- that display and the command that started its server.
@@ -282,6 +284,7 @@ chrome-agent save 'mysite-*'                 # every matching instance
 chrome-agent restore mysite-01               # the latest version
 chrome-agent restore mysite-01@20260927T153000Z
 chrome-agent restore                         # everything launched from the current directory
+chrome-agent restore mysite-04 --as mysite-01  # bring it back under a new name
 chrome-agent snapshots                       # list: name@stamp, saved, tabs, size, port, origin dir
 chrome-agent snapshots show mysite-01        # tabs, observers, launch flags, desktop
 chrome-agent snapshots rm mysite-01          # every version (asks first; --yes when scripted)
@@ -293,6 +296,8 @@ chrome-agent snapshots rm --older-than 30d
 **Consistency.** `--stop` closes the browser cleanly before copying, so every database is complete on disk; use it before a reboot. A live save copies the files while Chrome runs without taking any lock (Chrome holds most of its SQLite databases exclusively, and a reader's lock on the rest could make Chrome's own writes fail), re-reading any file that changes mid-copy. Cookies are captured from the running browser either way, so they do not depend on what Chrome has flushed to disk.
 
 **Encryption.** Snapshots are credential bundles, so every snapshot file except a small plaintext summary (no URLs, no cookies) is encrypted with AES-256-GCM under a key kept in the OS keyring (GNOME Keyring / KWallet, macOS Keychain, Windows Credential Locker). The keyring unlocks at login, so restores need no prompt; a snapshot that ends up in a backup or a synced folder is unreadable without the key. **If the keyring is lost, the snapshots are unrecoverable** -- back the key up with `chrome-agent snapshots export-key`, and load it on another machine with `chrome-agent snapshots import-key < keyfile`. On a host with no keyring service, set `CHROME_AGENT_SNAPSHOT_KEY` to a base64 32-byte key. Snapshots live in `~/.local/share/chrome-agent/snapshots/` (mode 0700).
+
+**Renaming.** `save --as NAME` names the *snapshot*, not the session: the snapshot still records the instance name it was saved from, and a plain `restore` brings that name back. To bring a session back under a different instance name, use `restore <snapshot> --as NEW-NAME`. Everything else -- tabs, logins, port, windows -- comes back as saved, and `attach` observers that named the old instance are restarted against the new one. The snapshot is left unchanged (restoring it without `--as` still gives the old name); the next `save` of the renamed browser is filed under the new name. `--as` restores exactly one snapshot, so it cannot be combined with `--all` or a glob matching several.
 
 **Restoring safely.** `restore` refuses when the instance is already running (it was restored already, or the original never closed), when the saved port is taken by something else (`--any-port` picks a new one), or when a custom profile directory already exists (`--replace-profile` moves it aside rather than deleting it). It warns when the installed Chrome is older than the one that saved the snapshot, since an older Chrome may refuse a newer profile. Sites that bind a login to a device or IP, or expire it server-side, may still ask you to sign in again.
 
@@ -382,7 +387,7 @@ Derived this way, the version and platform always match the installed Chrome; a 
 
 ## For AI Agents
 
-See [AGENTS.md](AGENTS.md) for concise agent instructions (the standard for AI agent tool documentation). It covers the mental model (address an instance, send any CDP command), the sense ⇄ act loop, the two channels, the command reference, and gotchas.
+See [AGENTS.md](https://github.com/captivus/chrome-agent/blob/main/AGENTS.md) for concise agent instructions (the standard for AI agent tool documentation). It covers the mental model (address an instance, send any CDP command), the sense ⇄ act loop, the two channels, the command reference, and gotchas.
 
 **The guide ships with the package**, so an agent can reach it from any install without a checkout:
 
@@ -405,16 +410,16 @@ ln -s "$(chrome-agent guide --path)" AGENTS-chrome-agent.md
 
 Multiple participants -- humans, AI agents, or both -- can share a browser simultaneously. Each participant creates an independent CDP session with isolated event subscriptions. One agent enabling Network observation does not flood another agent's event stream.
 
-See [docs/collaboration-guide.md](docs/collaboration-guide.md) for:
+See [docs/collaboration-guide.md](https://github.com/captivus/chrome-agent/blob/main/docs/collaboration-guide.md) for:
 - Human-agent collaboration patterns (you browse, agent watches)
 - Agent-driven workflows (agent drives, you supervise)
 - Multi-agent setups with isolated event subscriptions
 - The observation gap (what CDP sees vs what it misses)
 - Full interaction observation via the binding bridge
 
-For real-time observation using Claude Code's Monitor tool, see [AGENTS.md](AGENTS.md#reacting-to-events-as-they-happen-monitor) for the practical usage path (subscribing, discovering events via `help`, the gotchas), and [docs/monitor-integration.md](docs/monitor-integration.md) for the architecture and usage patterns in depth.
+For real-time observation using Claude Code's Monitor tool, see [AGENTS.md](AGENTS.md#reacting-to-events-as-they-happen-monitor) for the practical usage path (subscribing, discovering events via `help`, the gotchas), and [docs/monitor-integration.md](https://github.com/captivus/chrome-agent/blob/main/docs/monitor-integration.md) for the architecture and usage patterns in depth.
 
-Monitor is specific to Claude Code. Agents on other harnesses can still be event-driven rather than falling back to fixed sleeps -- background `attach` to a file once, then block on [`scripts/cdp-wait.py`](scripts/cdp-wait.py), which returns the instant a matching event lands and also catches events that fired before the wait began. See [docs/event-driven-without-monitor.md](docs/event-driven-without-monitor.md).
+Monitor is specific to Claude Code. Agents on other harnesses can still be event-driven rather than falling back to fixed sleeps -- background `attach` to a file once, then block on [`scripts/cdp-wait.py`](https://github.com/captivus/chrome-agent/blob/main/scripts/cdp-wait.py), which returns the instant a matching event lands and also catches events that fired before the wait began. See [docs/event-driven-without-monitor.md](https://github.com/captivus/chrome-agent/blob/main/docs/event-driven-without-monitor.md).
 
 ## Requirements
 

@@ -256,3 +256,84 @@ def test_browser_placements_ignores_unknown_ports():
     from chrome_agent.desktop import browser_placements
 
     assert browser_placements([_free_port()]) == {}
+
+
+# -- tab order -----------------------------------------------------------------
+
+def _target(tid: str, index: int) -> PageTarget:
+    return PageTarget(target_id=tid, short_id=tid[:8], index=index, url=f"https://{tid}/", title=tid)
+
+
+def test_order_targets_sorts_by_window_then_position(monkeypatch):
+    """Tabs follow the extension's on-screen order and are renumbered by it."""
+    from chrome_agent import instance_status, taborder
+
+    targets = [_target("AAAA", 1), _target("BBBB", 2), _target("CCCC", 3), _target("DDDD", 4)]
+    positions = {"CCCC": (7, 0), "AAAA": (7, 1), "DDDD": (9, 0)}  # BBBB unseen
+
+    class FakeClient:
+        def __init__(self, ws_url): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+
+    async def fake_positions(cdp):
+        return positions
+
+    monkeypatch.setattr("chrome_agent.cdp_client.CDPClient", FakeClient)
+    monkeypatch.setattr("chrome_agent.cdp_client.get_ws_url", lambda port, target_type: "ws://x")
+    monkeypatch.setattr(taborder, "tab_positions", fake_positions)
+
+    assert instance_status.order_targets({9222: targets}) == {9222}
+
+    assert [t.target_id for t in targets] == ["CCCC", "AAAA", "DDDD", "BBBB"]
+    assert [t.index for t in targets] == [1, 2, 3, 4]
+    assert [(t.window, t.position) for t in targets] == [(1, 1), (1, 2), (2, 1), (None, None)]
+
+
+def test_order_targets_keeps_listing_when_order_unreadable(monkeypatch):
+    from chrome_agent import instance_status
+
+    def refuse(port, target_type):
+        raise ConnectionError("nothing there")
+
+    monkeypatch.setattr("chrome_agent.cdp_client.get_ws_url", refuse)
+    targets = [_target("AAAA", 1), _target("BBBB", 2)]
+    assert instance_status.order_targets({9222: targets}) == set()
+    assert [(t.target_id, t.index) for t in targets] == [("AAAA", 1), ("BBBB", 2)]
+    text = format_status_text([InstanceStatus(name="x-01", port=9222, alive=True, targets=targets)])
+    assert "tab order unavailable" in text
+
+
+def test_format_status_text_separates_windows():
+    a, b, c = _target("AAAA", 1), _target("BBBB", 2), _target("CCCC", 3)
+    a.window, a.position = 1, 1
+    b.window, b.position = 1, 2
+    c.window, c.position = 2, 1
+    text = format_status_text([InstanceStatus(name="x-01", port=9222, alive=True, targets=[a, b, c], tab_order=True)])
+    assert text.splitlines()[1:] == [
+        '  [1] AAAA  https://AAAA/  "AAAA"',
+        '  [2] BBBB  https://BBBB/  "BBBB"',
+        "  --- window",
+        '  [3] CCCC  https://CCCC/  "CCCC"',
+    ]
+    entry = json.loads(format_status_json([InstanceStatus(name="x-01", port=9222, alive=True, targets=[c])]))[0]
+    assert (entry["targets"][0]["window"], entry["targets"][0]["position"]) == (2, 1)
+
+
+def test_single_tab_is_window_1_position_1_without_a_lookup(tmp_path, monkeypatch):
+    from chrome_agent import instance_status
+
+    reg_path = str(tmp_path / "registry.json")
+    _write_registry(reg_path, {"solo-01": {"port": 9222, "pid": os.getpid()}})
+    monkeypatch.setattr("chrome_agent.registry._instance_is_alive", lambda *a, **k: True)
+    monkeypatch.setattr("chrome_agent.desktop.browser_placements", lambda ports: {})
+    monkeypatch.setattr(instance_status, "query_targets", lambda *, port: [_target("AAAA", 1)])
+
+    def no_lookup(targets_by_port):
+        assert not any(len(t) > 1 for t in targets_by_port.values())
+        return set()
+
+    monkeypatch.setattr(instance_status, "order_targets", no_lookup)
+    status = get_instance_status(registry_path=reg_path, order_tabs=True)[0]
+    assert status.tab_order
+    assert (status.targets[0].window, status.targets[0].position) == (1, 1)
