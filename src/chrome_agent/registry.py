@@ -9,6 +9,7 @@ All public functions accept an optional registry_path parameter for test
 isolation.
 """
 
+import contextlib
 import fnmatch
 import json
 import logging
@@ -16,6 +17,8 @@ import os
 import re
 import shutil
 import socket
+import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -185,10 +188,83 @@ def _load_registry(registry_path: str) -> dict:
 def _save_registry(registry: dict, registry_path: str) -> None:
     """Save the registry atomically via temp-file-and-rename."""
     os.makedirs(os.path.dirname(registry_path), exist_ok=True)
-    tmp_path = registry_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(registry, f, indent=2)
-    os.rename(tmp_path, registry_path)
+    # A temp file of its own: concurrent launches each save, and a shared
+    # name let one rename the other's file away (FileNotFoundError).
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(registry_path) + ".", suffix=".tmp",
+        dir=os.path.dirname(registry_path),
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(registry, f, indent=2)
+        os.chmod(tmp_path, 0o664)
+        os.rename(tmp_path, registry_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# Per-registry-path lock state in this process: [RLock, depth, fd]. The flock
+# is taken by the outermost holder only, so a function holding the lock can
+# call another that takes it (flock on a second descriptor would deadlock).
+_registry_locks: dict[str, list] = {}
+_registry_locks_guard = threading.Lock()
+
+
+@contextlib.contextmanager
+def _registry_lock(registry_path: str):
+    """Hold the registry's lock (``<registry>.lock``) for a read-modify-write.
+
+    Every change to the registry reads the whole file, edits it, and writes it
+    back. Without a lock, two of those at once (concurrent launches, a launch
+    and a supervisor retiring its browser) lost one writer's change: live
+    browsers dropped out of the registry, where no owner check or ``status``
+    could see them, and their names were handed out again. Re-entrant within
+    a process. Degrades to no lock where flock is unavailable.
+    """
+    with _registry_locks_guard:
+        state = _registry_locks.setdefault(registry_path, [threading.RLock(), 0, None])
+    with state[0]:
+        if state[1] == 0:
+            state[2] = _flock(registry_path + ".lock")
+        state[1] += 1
+        try:
+            yield
+        finally:
+            state[1] -= 1
+            if state[1] == 0 and state[2] is not None:
+                os.close(state[2])  # closing the descriptor releases the flock
+                state[2] = None
+
+
+def _flock(lock_path: str) -> int | None:
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o664)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+@contextlib.contextmanager
+def _editing_registry(registry_path: str):
+    """Load the registry under its lock, yield it for editing, then save it."""
+    with _registry_lock(registry_path):
+        registry = _load_registry(registry_path)
+        yield registry
+        _save_registry(registry, registry_path)
 
 
 def _port_is_listening(port: int) -> bool:
@@ -248,6 +324,71 @@ def _cdp_port_claimants(port: int) -> set[str]:
         else:
             claimants.add("")
     return claimants
+
+
+def _listening_inodes(port: int) -> set[str]:
+    """Socket inodes of the IPv4 loopback/any LISTEN sockets on ``port``.
+
+    chrome-agent reaches a browser at ``localhost``, which resolves to
+    127.0.0.1, so only the IPv4 listener matters: a browser that lost the
+    bind for 127.0.0.1 falls back to [::1] and is unreachable here.
+    """
+    inodes: set[str] = set()
+    want = f"{port:04X}"
+    try:
+        with open("/proc/net/tcp") as f:
+            next(f, None)
+            for line in f:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != "0A":  # 0A = LISTEN
+                    continue
+                addr, _, lport = fields[1].partition(":")
+                if lport == want and addr in ("0100007F", "00000000"):
+                    inodes.add(fields[9])
+    except OSError:
+        pass
+    return inodes
+
+
+def port_listener_profile(port: int) -> str | None:
+    """The ``--user-data-dir`` of the browser serving CDP on ``port``.
+
+    Finds the process that holds the listening socket (not merely one that
+    names the port on its command line: two browsers given the same port
+    both claim it, and only one serves it). Returns None when this cannot
+    be told (non-Linux, no listener, or the holder is not readable) -- callers
+    treat None as "unknown", never as "someone else's".
+    """
+    inodes = _listening_inodes(port)
+    if not inodes:
+        return None
+    targets = {f"socket:[{i}]" for i in inodes}
+    needle = f"--remote-debugging-port={port}"
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                tokens = f.read().replace(b"\0", b" ").decode(errors="replace").split()
+            if needle not in tokens or any(t.startswith("--type=") for t in tokens):
+                continue
+            fds = os.listdir(f"/proc/{entry}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{entry}/fd/{fd}") in targets:
+                    for token in tokens:
+                        if token.startswith("--user-data-dir="):
+                            return token.split("=", 1)[1]
+                    return ""
+            except OSError:
+                continue
+    return None
 
 
 def _instance_is_alive(
@@ -363,8 +504,19 @@ def register(
     the same way. ``owner`` records the agent session it belongs to.
     """
     path = _resolve_path(registry_path)
-    registry = _load_registry(path)
+    with _editing_registry(path) as registry:
+        return _register_into(
+            registry, working_dir=working_dir, pid=pid, browser_version=browser_version,
+            user_data_dir=user_data_dir, port_override=port_override, pid_start=pid_start,
+            name_override=name_override, launch=launch, owner=owner,
+        )
 
+
+def _register_into(
+    registry: dict, *, working_dir: str, pid: int, browser_version: str,
+    user_data_dir: str, port_override: int | None, pid_start: str | None,
+    name_override: str | None, launch: dict | None, owner: dict | None,
+) -> InstanceInfo:
     if port_override is not None:
         port = port_override
     else:
@@ -389,7 +541,6 @@ def register(
         registry[instance_name]["launch"] = launch
     if owner is not None:
         registry[instance_name]["owner"] = owner
-    _save_registry(registry, path)
 
     logger.info("Registered instance %s on port %d (pid %d)", instance_name, port, pid)
 
@@ -498,13 +649,14 @@ def set_owner(
     check, so the change takes effect at once.
     """
     path = _resolve_path(registry_path)
-    registry = _load_registry(path)
-    if instance_name not in registry:
-        raise InstanceNotFoundError(name=instance_name, available=list(registry.keys()))
-    previous = registry[instance_name].pop("owner", None)
-    if owner is not None:
-        registry[instance_name]["owner"] = owner
-    _save_registry(registry, path)
+    with _registry_lock(path):
+        registry = _load_registry(path)
+        if instance_name not in registry:
+            raise InstanceNotFoundError(name=instance_name, available=list(registry.keys()))
+        previous = registry[instance_name].pop("owner", None)
+        if owner is not None:
+            registry[instance_name]["owner"] = owner
+        _save_registry(registry, path)
     return previous
 
 
@@ -567,13 +719,7 @@ def stop(
 
     if not info.alive:
         # Already dead -- just clean up the registry entry
-        registry = _load_registry(path)
-        entry = registry.pop(instance_name, None)
-        if entry:
-            session_dir = entry.get("user_data_dir")
-            if session_dir and os.path.exists(session_dir):
-                shutil.rmtree(session_dir, ignore_errors=True)
-        _save_registry(registry, path)
+        _forget(instance_name, path)
         logger.info("Instance %s was already dead, cleaned up", instance_name)
         return f"{instance_name} was already dead, cleaned up"
 
@@ -626,13 +772,7 @@ def stop(
                 f"{instance_name} was stale (port {info.port} serves a different "
                 f"browser), cleaned up without touching it"
             )
-        registry = _load_registry(path)
-        entry = registry.pop(instance_name, None)
-        if entry:
-            session_dir = entry.get("user_data_dir")
-            if session_dir and os.path.exists(session_dir):
-                shutil.rmtree(session_dir, ignore_errors=True)
-        _save_registry(registry, path)
+        _forget(instance_name, path)
         logger.info("%s", outcome)
         return outcome
 
@@ -672,16 +812,19 @@ def stop(
         time.sleep(0.1)
 
     # Clean up registry entry and session directory
-    registry = _load_registry(path)
-    entry = registry.pop(instance_name, None)
-    if entry:
-        session_dir = entry.get("user_data_dir")
-        if session_dir and os.path.exists(session_dir):
-            shutil.rmtree(session_dir, ignore_errors=True)
-    _save_registry(registry, path)
+    _forget(instance_name, path)
 
     logger.info("Stopped instance %s", instance_name)
     return f"Stopped {instance_name}"
+
+
+def _forget(instance_name: str, path: str) -> None:
+    """Drop an entry (under the lock) and delete its session directory."""
+    with _editing_registry(path) as registry:
+        entry = registry.pop(instance_name, None)
+    session_dir = (entry or {}).get("user_data_dir")
+    if session_dir and os.path.exists(session_dir):
+        shutil.rmtree(session_dir, ignore_errors=True)
 
 
 def _remove_session_dir(session_dir: str) -> None:
@@ -718,11 +861,12 @@ def deregister(
     Returns True if an entry was removed.
     """
     path = _resolve_path(registry_path)
-    registry = _load_registry(path)
-    entry = registry.pop(instance_name, None)
-    if entry is None:
-        return False
-    _save_registry(registry, path)
+    with _registry_lock(path):
+        registry = _load_registry(path)
+        entry = registry.pop(instance_name, None)
+        if entry is None:
+            return False
+        _save_registry(registry, path)
     session_dir = entry.get("user_data_dir")
     if session_dir:
         _remove_session_dir(session_dir)
@@ -738,22 +882,19 @@ def cleanup(
     Returns the list of removed instance names.
     """
     path = _resolve_path(registry_path)
-    registry = _load_registry(path)
-
     removed = []
-    for name, entry in list(registry.items()):
-        if not _instance_is_alive(
-            entry["pid"],
-            entry["port"],
-            pid_start=entry.get("pid_start"),
-            user_data_dir=entry.get("user_data_dir", ""),
-        ):
-            del registry[name]
-            removed.append(name)
-            session_dir = entry.get("user_data_dir")
-            if session_dir and os.path.exists(session_dir):
-                shutil.rmtree(session_dir, ignore_errors=True)
-            logger.info("Cleaned up stale instance %s", name)
-
-    _save_registry(registry, path)
+    with _editing_registry(path) as registry:
+        for name, entry in list(registry.items()):
+            if not _instance_is_alive(
+                entry["pid"],
+                entry["port"],
+                pid_start=entry.get("pid_start"),
+                user_data_dir=entry.get("user_data_dir", ""),
+            ):
+                del registry[name]
+                removed.append(name)
+                session_dir = entry.get("user_data_dir")
+                if session_dir and os.path.exists(session_dir):
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                logger.info("Cleaned up stale instance %s", name)
     return removed

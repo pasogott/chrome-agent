@@ -354,7 +354,10 @@ def _launch_record(entry: dict, name: str, tokens: list[str], pid: int | None) -
             except OSError:
                 pass
         supervisors = _supervisor_pids(name)
-        border = supervisors[0][1][-1] == "1" if supervisors else not headless
+        argv = supervisors[0][1] if supervisors else []
+        i = argv.index("chrome_agent.supervisor") if argv else 0
+        # PORT NAME REGISTRY DRAW_BORDER [USER_DATA_DIR] follow the module name.
+        border = argv[i + 4] == "1" if len(argv) > i + 4 else not headless
         record = {
             "headless": headless, "chrome_args": chrome_args,
             "env": env, "window_border": border,
@@ -803,7 +806,7 @@ def save_instance(
 ) -> Version:
     """Save one instance as a new version; with ``replace``, drop that version
     once the new one is written."""
-    from .registry import REGISTRY_PATH, _load_registry, _save_registry
+    from .registry import REGISTRY_PATH, _load_registry, _registry_lock, _save_registry
 
     key = get_key(create=True)
     live = asyncio.run(_capture_live(plan.port, plan.name))
@@ -893,9 +896,10 @@ def save_instance(
     if stop:
         # Retire the instance exactly as its supervisor would have, now that
         # the profile is safely in the snapshot.
-        registry = _load_registry(REGISTRY_PATH)
-        if registry.pop(plan.name, None) is not None:
-            _save_registry(registry, REGISTRY_PATH)
+        with _registry_lock(REGISTRY_PATH):
+            registry = _load_registry(REGISTRY_PATH)
+            if registry.pop(plan.name, None) is not None:
+                _save_registry(registry, REGISTRY_PATH)
         if plan.registered_dir.startswith("/tmp/chrome-agent/"):
             shutil.rmtree(plan.registered_dir, ignore_errors=True)
 

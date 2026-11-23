@@ -89,8 +89,24 @@ def build_overlay_script(*, name: str, color: str, host_id: str) -> str:
     return (
         "(() => {"
         f"  var NAME={NAME}, COLOR={COLOR}, HOST_ID={HOST};"
-        "  var PREFIX = '\\uD83E\\uDD16 ' + NAME + ' \\u2014 ';"  # 🤖 NAME —
-        "  function fixTitle(){ try { var t = document.title || ''; if (t.indexOf(PREFIX) !== 0) document.title = PREFIX + t; } catch(e){} }"
+        "  var MARK = '\\uD83E\\uDD16 ', PREFIX = MARK + NAME + ' \\u2014 ';"  # 🤖 NAME —
+        # Idempotent across labellers: a title that already carries ANY
+        # chrome-agent label (ours, or a second supervisor's on the same
+        # browser) is left alone. Checking only our own prefix let two
+        # supervisors re-prefix each other's change through their title
+        # observers forever -- an ever-growing title and a pegged CPU.
+        # As a backstop against any other loop (a page that strips the label
+        # whenever it is set), more than WRITE_CAP writes in a second ends
+        # title labelling for this document.
+        "  var WRITE_CAP = 20, writes = 0, windowStart = 0, titleObservers = [];"
+        "  function fixTitle(){ try {"
+        "    var t = document.title || '';"
+        "    if (t.indexOf(MARK) === 0) return;"
+        "    var now = Date.now(); if (now - windowStart > 1000) { windowStart = now; writes = 0; }"
+        "    if (++writes > WRITE_CAP) { titleObservers.forEach(function(o){ o.disconnect(); }); titleObservers = []; return; }"
+        "    document.title = PREFIX + t;"
+        "  } catch(e){} }"
+        "  function observeTitle(node, opts){ var o = new MutationObserver(fixTitle); o.observe(node, opts); titleObservers.push(o); }"
         "  function draw(){"
         "    try {"
         "      if (!document.documentElement) return false;"
@@ -109,8 +125,8 @@ def build_overlay_script(*, name: str, color: str, host_id: str) -> str:
         "  function watchTitle(){"
         "    fixTitle();"
         "    try {"
-        "      var t = document.querySelector('title'); if (t) new MutationObserver(fixTitle).observe(t, {childList:true, characterData:true, subtree:true});"
-        "      if (document.head) new MutationObserver(fixTitle).observe(document.head, {childList:true, subtree:true});"
+        "      var t = document.querySelector('title'); if (t) observeTitle(t, {childList:true, characterData:true, subtree:true});"
+        "      if (document.head) observeTitle(document.head, {childList:true, subtree:true});"
         "      if (document.documentElement) new MutationObserver(function(){ if (!document.getElementById(HOST_ID)) draw(); }).observe(document.documentElement, {childList:true});"
         "    } catch(e){}"
         "  }"
@@ -163,22 +179,72 @@ async def _release_target(cdp: CDPClient, session_id: str) -> None:
 OWNER_CHECK_INTERVAL = 5.0
 
 
-def owner_has_gone(name: str, registry_path: str | None) -> bool:
+class NotOurBrowser(Exception):
+    """The browser serving the supervised port is a different instance's."""
+
+
+def _entry_is_ours(entry: dict | None, user_data_dir: str | None) -> bool:
+    """Whether a registry entry is the instance this supervisor was started for.
+
+    Names are reused: once an entry is gone, a later launch from the same folder
+    registers the same name for a different browser. A supervisor that outlived
+    its own browser must not judge, stop or retire that newcomer. Without a
+    recorded profile (a supervisor started by an older chrome-agent) the name
+    is all there is to go on.
+    """
+    if entry is None:
+        return False
+    return user_data_dir is None or entry.get("user_data_dir") == user_data_dir
+
+
+def owner_has_gone(
+    name: str, registry_path: str | None, user_data_dir: str | None = None,
+) -> bool:
     """Whether the instance has an owner and that owner has certainly exited.
 
     False whenever there is no owner (the user's own browser, or one released
-    with ``keep``), the registry cannot be read, or the answer is uncertain --
+    with ``keep``), the registry cannot be read, the entry under ``name`` is a
+    different browser's (see ``_entry_is_ours``), or the answer is uncertain --
     a browser is only ever stopped on a definite verdict.
     """
     from .owner import owner_alive
     from .registry import _load_registry, _resolve_path
 
     entry = _load_registry(_resolve_path(registry_path)).get(name)
-    owner = entry.get("owner") if entry else None
+    if not _entry_is_ours(entry, user_data_dir):
+        return False
+    owner = entry.get("owner")
     return bool(owner) and owner_alive(owner) is False
 
 
-def _record_owner_stop(name: str, registry_path: str | None) -> None:
+def check_owner(
+    name: str, registry_path: str | None, user_data_dir: str | None, memory: dict,
+) -> tuple[bool, bool]:
+    """One owner check: ``(owner certainly gone, our registry entry exists)``.
+
+    While the entry under ``name`` is this browser's, its owner is the truth
+    (``keep`` clears it at once) and is remembered in ``memory["owner"]``. When
+    the entry is lost -- or the name now belongs to another browser -- the
+    remembered owner decides instead (seeded from launch), so a browser that
+    fell out of the registry is still stopped once its agent session ends.
+    That fallback needs ``user_data_dir``: without it a supervisor cannot tell
+    its own browser from a newer one on the same port.
+    """
+    from .owner import owner_alive
+    from .registry import _load_registry, _resolve_path
+
+    entry = _load_registry(_resolve_path(registry_path)).get(name)
+    if _entry_is_ours(entry, user_data_dir):
+        memory["owner"] = entry.get("owner")
+        owner, ours = memory["owner"], True
+    elif user_data_dir is not None:
+        owner, ours = memory.get("owner"), False
+    else:
+        return False, False
+    return bool(owner) and owner_alive(owner) is False, ours
+
+
+def _record_owner_stop(name: str, registry_path: str | None, owner: dict | None = None) -> None:
     """Leave a line saying why the browser went away, next to the registry."""
     import datetime
     import os
@@ -186,7 +252,9 @@ def _record_owner_stop(name: str, registry_path: str | None) -> None:
     from .registry import _load_registry, _resolve_path
 
     path = _resolve_path(registry_path)
-    owner = (_load_registry(path).get(name) or {}).get("owner") or {}
+    if owner is None:
+        owner = (_load_registry(path).get(name) or {}).get("owner")
+    owner = owner or {}
     try:
         with open(os.path.join(os.path.dirname(path), "owner-stops.log"), "a") as f:
             f.write(
@@ -200,6 +268,7 @@ def _record_owner_stop(name: str, registry_path: str | None) -> None:
 async def _supervise_connection(
     *, port: int, draw_border: bool, source: str | None,
     name: str | None = None, registry_path: str | None = None,
+    user_data_dir: str | None = None, owner_memory: dict | None = None,
 ) -> None:
     """Hold one browser-level CDP connection until it drops.
 
@@ -208,7 +277,19 @@ async def _supervise_connection(
     connection drops. Returns when disconnected; raises if the connect itself
     fails. Caller decides whether a drop means the browser closed (retire) or was
     a transient blip (reconnect).
+
+    Raises ``NotOurBrowser`` without connecting when the port is served by a
+    browser with a different profile than ``user_data_dir``: two launches given
+    the same port (the loser falls back to [::1], out of reach), or a port
+    reused after this supervisor's browser closed. Marking that browser too
+    put two labels on one tab -- the runaway title loop of 2026-11-21.
     """
+    if user_data_dir is not None:
+        from .registry import port_listener_profile
+
+        holder = await asyncio.to_thread(port_listener_profile, port)
+        if holder is not None and holder != user_data_dir:
+            raise NotOurBrowser(holder)
     browser_ws = get_ws_url(port=port, target_type="browser")
     cdp = CDPClient(ws_url=browser_ws)
     await cdp.connect()
@@ -239,6 +320,7 @@ async def _supervise_connection(
             params={"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
         )
 
+    memory = owner_memory if owner_memory is not None else {}
     loop = asyncio.get_event_loop()
     last_check = loop.time()
     strikes = 0
@@ -248,19 +330,28 @@ async def _supervise_connection(
             if name is None or loop.time() - last_check < OWNER_CHECK_INTERVAL:
                 continue
             last_check = loop.time()
-            gone = await asyncio.to_thread(owner_has_gone, name, registry_path)
+            gone, ours = await asyncio.to_thread(
+                check_owner, name, registry_path, user_data_dir, memory,
+            )
             strikes = strikes + 1 if gone else 0
             if strikes >= 2:
-                from .registry import stop
-
-                _record_owner_stop(name, registry_path)
-                # registry.stop verifies the port is this browser's before
-                # closing it, falls back to a verified SIGTERM, and retires
-                # the entry; the dropped connection then ends this loop.
+                _record_owner_stop(name, registry_path, memory.get("owner"))
                 try:
-                    await asyncio.to_thread(stop, instance_name=name, registry_path=registry_path)
+                    if ours:
+                        from .registry import stop
+
+                        # registry.stop verifies the port is this browser's
+                        # before closing it, falls back to a verified SIGTERM,
+                        # and retires the entry.
+                        await asyncio.to_thread(stop, instance_name=name, registry_path=registry_path)
+                    else:
+                        # No entry of ours to stop by: close the browser over
+                        # this connection, which was verified to be ours when
+                        # it was opened.
+                        await cdp.send(method="Browser.close")
                 except Exception:
                     pass
+                # The dropped connection then ends supervision.
                 return
     finally:
         await cdp.close()
@@ -273,26 +364,40 @@ async def _supervise_connection(
 _RETIRE_GRACE_SECONDS = 5.0
 
 
-async def _browser_gone(port: int) -> bool:
+async def _browser_gone(port: int, user_data_dir: str | None = None) -> bool:
     """Whether the browser is truly gone, vs. a transient CDP drop.
 
     Polls the CDP port for up to ``_RETIRE_GRACE_SECONDS``. Returns True as soon
     as the port stops listening (the browser closed), or False if it stays up
     for the whole window (the drop was transient -- e.g. a host suspend/resume
     severed the WebSocket while Chrome kept running and listening).
+
+    With ``user_data_dir`` known, a listener is only "our browser" while some
+    process still claims the port with our profile: once none does, our browser
+    is gone even though another browser now listens on the port.
     """
-    from .registry import _port_is_listening
+    from .registry import _cdp_port_claimants, _port_is_listening
 
     deadline = asyncio.get_event_loop().time() + _RETIRE_GRACE_SECONDS
     while asyncio.get_event_loop().time() < deadline:
         if not _port_is_listening(port):
             return True
+        if user_data_dir is not None:
+            claimants = _cdp_port_claimants(port=port)
+            if claimants and user_data_dir not in claimants:
+                return True
         await asyncio.sleep(0.2)
     return False
 
 
+# Seconds between looks while the supervised port is served by another
+# browser and ours is still alive (it lost the bind, or is shutting down).
+_NOT_OURS_RETRY_SECONDS = 2.0
+
+
 async def run_supervisor(
-    *, port: int, name: str, registry_path: str | None = None, draw_border: bool = True
+    *, port: int, name: str, registry_path: str | None = None, draw_border: bool = True,
+    user_data_dir: str | None = None, owner: dict | None = None,
 ) -> None:
     """Supervise a launched browser until it actually closes.
 
@@ -308,8 +413,12 @@ async def run_supervisor(
     a suspend. Instead, when the connection drops we consult the port via
     ``_browser_gone`` -- the same signal ``_instance_is_alive`` trusts -- and
     reconnect-and-resume if the browser is still up, retiring only once it is gone.
+
+    ``user_data_dir`` (the instance's profile) makes "the browser" mean OUR
+    browser: the supervisor never marks, stops or retires a different browser
+    that happens to serve the port, or a different entry that reuses the name.
     """
-    from .registry import deregister
+    from .registry import _load_registry, _resolve_path, deregister
 
     # Compute the border host id / script ONCE so reconnects reuse the same
     # randomized host id and the overlay's idempotent guard suppresses redraws.
@@ -318,21 +427,43 @@ async def run_supervisor(
         host_id = "_ca" + secrets.token_hex(8)
         source = build_overlay_script(name=name, color=derive_color(name), host_id=host_id)
 
+    owner_memory = {"owner": owner}
     while True:
+        not_ours = False
         try:
             await _supervise_connection(
                 port=port, draw_border=draw_border, source=source,
-                name=name, registry_path=registry_path,
+                name=name, registry_path=registry_path, user_data_dir=user_data_dir,
+                owner_memory=owner_memory,
             )
+        except NotOurBrowser:
+            not_ours = True
         except Exception:
             # A failed (re)connect or a mid-stream CDP error lands here; fall
             # through to the liveness check to decide retire-vs-reconnect.
             pass
 
-        if await _browser_gone(port):
-            # Browser really closed -> retire from the registry and exit.
-            deregister(instance_name=name, registry_path=registry_path)
+        if await _browser_gone(port, user_data_dir):
+            # Browser really closed -> retire from the registry and exit,
+            # unless the name now belongs to a different browser.
+            entry = _load_registry(_resolve_path(registry_path)).get(name)
+            if user_data_dir is None or _entry_is_ours(entry, user_data_dir):
+                deregister(instance_name=name, registry_path=registry_path)
+            elif not any(
+                e.get("user_data_dir") == user_data_dir
+                for e in _load_registry(_resolve_path(registry_path)).values()
+            ):
+                # Our entry was lost: nothing else will remove the profile.
+                from .registry import _remove_session_dir
+
+                _remove_session_dir(user_data_dir)
             return
+
+        if not_ours:
+            # Our browser lives but another serves the port: leave that one
+            # alone and look again later.
+            await asyncio.sleep(_NOT_OURS_RETRY_SECONDS)
+            continue
 
         # Transient drop -- the browser is still alive. Reconnect and resume
         # supervising (re-installs the border on the live tabs) rather than
@@ -341,31 +472,43 @@ async def run_supervisor(
 
 
 def spawn_supervisor(
-    *, port: int, name: str, registry_path: str, draw_border: bool
+    *, port: int, name: str, registry_path: str, draw_border: bool,
+    user_data_dir: str | None = None, owner: dict | None = None,
 ) -> subprocess.Popen:
     """Spawn the detached per-instance supervisor process for a launched browser."""
+    argv = [
+        sys.executable, "-m", "chrome_agent.supervisor",
+        str(port), name, registry_path, "1" if draw_border else "0",
+    ]
+    if user_data_dir or owner:
+        argv.append(user_data_dir or "")
+    if owner:
+        argv.append(json.dumps(owner, separators=(",", ":")))
     return subprocess.Popen(
-        [
-            sys.executable, "-m", "chrome_agent.supervisor",
-            str(port), name, registry_path, "1" if draw_border else "0",
-        ],
+        argv,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
 
 def main() -> None:
-    """Entry point: `python -m chrome_agent.supervisor PORT NAME REGISTRY_PATH DRAW_BORDER`."""
+    """Entry point: `python -m chrome_agent.supervisor PORT NAME REGISTRY_PATH DRAW_BORDER [USER_DATA_DIR [OWNER_JSON]]`."""
     if len(sys.argv) < 5:
-        print("usage: python -m chrome_agent.supervisor PORT NAME REGISTRY_PATH DRAW_BORDER", file=sys.stderr)
+        print("usage: python -m chrome_agent.supervisor PORT NAME REGISTRY_PATH DRAW_BORDER [USER_DATA_DIR [OWNER_JSON]]", file=sys.stderr)
         sys.exit(2)
     port = int(sys.argv[1])
     name = sys.argv[2]
     registry_path = sys.argv[3]
     draw_border = sys.argv[4] == "1"
+    user_data_dir = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
+    try:
+        owner = json.loads(sys.argv[6]) if len(sys.argv) > 6 else None
+    except ValueError:
+        owner = None
     try:
         asyncio.run(run_supervisor(
             port=port, name=name, registry_path=registry_path, draw_border=draw_border,
+            user_data_dir=user_data_dir, owner=owner,
         ))
     except KeyboardInterrupt:
         pass
